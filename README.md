@@ -210,4 +210,4 @@ MindVault 的 V1 设计遵循以下原则：
 
 ## License
 
-当前项目尚未选择开源许可证。正式公开前建议补充 `LICENSE` 文件。
+本项目基于 [MIT License](./LICENSE) 开源。
