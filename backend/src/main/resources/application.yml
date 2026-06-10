@@ -1,0 +1,11 @@
+spring:
+  application:
+    name: mindvault-backend
+  profiles:
+    default: local
+
+server:
+  port: 8080
+
+mindvault:
+  api-prefix: /api
