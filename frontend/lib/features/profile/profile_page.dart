@@ -6,6 +6,7 @@ import '../../app/theme.dart';
 import '../../core/api/api_client.dart';
 import '../../core/api/api_models.dart';
 import '../../core/api/providers.dart';
+import '../../core/storage/local_preferences.dart';
 
 class ProfilePage extends ConsumerStatefulWidget {
   const ProfilePage({super.key});
@@ -49,6 +50,7 @@ class _ProfilePageState extends ConsumerState<ProfilePage> {
             onBack: () => context.go('/'),
             onSignOut: () {
               ref.read(authTokenProvider.notifier).state = null;
+              LocalPreferences.saveAuthToken(null);
               context.go('/login');
             },
           ),

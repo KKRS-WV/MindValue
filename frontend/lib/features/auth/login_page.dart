@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/api/providers.dart';
+import '../../core/storage/local_preferences.dart';
 
 class LoginPage extends ConsumerStatefulWidget {
   const LoginPage({super.key});
@@ -17,6 +18,12 @@ class _LoginPageState extends ConsumerState<LoginPage> {
   final _passwordController = TextEditingController(text: 'password123');
   bool _loading = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    Future.microtask(_restoreExistingSession);
+  }
 
   @override
   void dispose() {
@@ -82,6 +89,7 @@ class _LoginPageState extends ConsumerState<LoginPage> {
             _passwordController.text,
           );
       ref.read(authTokenProvider.notifier).state = response.token;
+      await LocalPreferences.saveAuthToken(response.token);
       if (mounted) {
         context.go('/');
       }
@@ -92,5 +100,14 @@ class _LoginPageState extends ConsumerState<LoginPage> {
         setState(() => _loading = false);
       }
     }
+  }
+
+  Future<void> _restoreExistingSession() async {
+    final token = await LocalPreferences.readAuthToken();
+    if (token == null || token.isEmpty || !mounted) {
+      return;
+    }
+    ref.read(authTokenProvider.notifier).state = token;
+    context.go('/');
   }
 }

@@ -6,7 +6,7 @@ import '../features/knowledge_base/home_page.dart';
 import '../features/profile/profile_page.dart';
 
 final appRouter = GoRouter(
-  initialLocation: '/login',
+  initialLocation: '/',
   routes: [
     GoRoute(
       path: '/',

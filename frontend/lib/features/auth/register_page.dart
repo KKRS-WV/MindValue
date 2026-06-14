@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../core/api/api_client.dart';
 import '../../core/api/providers.dart';
+import '../../core/storage/local_preferences.dart';
 
 class RegisterPage extends ConsumerStatefulWidget {
   const RegisterPage({super.key});
@@ -88,6 +89,7 @@ class _RegisterPageState extends ConsumerState<RegisterPage> {
             _passwordController.text,
           );
       ref.read(authTokenProvider.notifier).state = response.token;
+      await LocalPreferences.saveAuthToken(response.token);
       if (mounted) {
         context.go('/');
       }

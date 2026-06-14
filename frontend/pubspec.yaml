@@ -16,6 +16,7 @@ dependencies:
   json_annotation: ^4.9.0
   flutter_markdown: ^0.7.3
   graphview: ^1.2.0
+  shared_preferences: ^2.3.2
 
 dev_dependencies:
   flutter_test:

@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 
-import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../app/theme.dart';
 import '../../core/api/api_models.dart';
@@ -10,10 +10,16 @@ class KnowledgeGraphCanvas extends StatefulWidget {
   const KnowledgeGraphCanvas({
     required this.nodes,
     required this.selectedNode,
+    required this.focusNodeRequestId,
+    required this.layoutLocked,
     required this.onNodeTap,
     required this.onNodeDoubleTap,
     required this.onNodePositionChanged,
     required this.onNodePositionCommitted,
+    required this.onCreateChildNode,
+    required this.onRenameNode,
+    required this.onDeleteNode,
+    required this.onToggleCollapseBranch,
     required this.onCanvasTap,
     required this.onCanvasDoubleTap,
     super.key,
@@ -21,10 +27,16 @@ class KnowledgeGraphCanvas extends StatefulWidget {
 
   final List<KnowledgeNode> nodes;
   final KnowledgeNode? selectedNode;
+  final int focusNodeRequestId;
+  final bool layoutLocked;
   final ValueChanged<KnowledgeNode> onNodeTap;
   final ValueChanged<KnowledgeNode> onNodeDoubleTap;
   final void Function(KnowledgeNode node, Offset position) onNodePositionChanged;
   final void Function(KnowledgeNode node, Offset position) onNodePositionCommitted;
+  final ValueChanged<KnowledgeNode> onCreateChildNode;
+  final ValueChanged<KnowledgeNode> onRenameNode;
+  final ValueChanged<KnowledgeNode> onDeleteNode;
+  final ValueChanged<KnowledgeNode> onToggleCollapseBranch;
   final VoidCallback onCanvasTap;
   final VoidCallback onCanvasDoubleTap;
 
@@ -32,17 +44,43 @@ class KnowledgeGraphCanvas extends StatefulWidget {
   State<KnowledgeGraphCanvas> createState() => _KnowledgeGraphCanvasState();
 }
 
-class _KnowledgeGraphCanvasState extends State<KnowledgeGraphCanvas> {
+class _KnowledgeGraphCanvasState extends State<KnowledgeGraphCanvas> with SingleTickerProviderStateMixin {
+  static const _maxCanvasScale = 3.5;
+  static const _minCanvasScaleFloor = 0.2;
+  static const _wheelScaleFactor = 240.0;
+
   final _transformationController = TransformationController();
+  late final AnimationController _transformAnimationController;
+  Animation<Matrix4>? _transformAnimation;
   int? _focusedNodeId;
   int? _hoveredNodeId;
   int? _draggingNodeId;
   Offset? _lastDragPosition;
   double _dragDistance = 0;
   String? _canvasViewKey;
+  int _handledFocusNodeRequestId = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    BrowserContextMenu.disableContextMenu();
+    _transformationController.addListener(_handleTransformChanged);
+    _transformAnimationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 260),
+    )..addListener(() {
+        final animation = _transformAnimation;
+        if (animation != null) {
+          _transformationController.value = animation.value;
+        }
+      });
+  }
 
   @override
   void dispose() {
+    BrowserContextMenu.enableContextMenu();
+    _transformationController.removeListener(_handleTransformChanged);
+    _transformAnimationController.dispose();
     _transformationController.dispose();
     super.dispose();
   }
@@ -64,141 +102,261 @@ class _KnowledgeGraphCanvasState extends State<KnowledgeGraphCanvas> {
             }
           });
         }
+        if (widget.focusNodeRequestId != _handledFocusNodeRequestId && widget.selectedNode != null) {
+          _handledFocusNodeRequestId = widget.focusNodeRequestId;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted || widget.selectedNode == null) {
+              return;
+            }
+            _centerNodeInViewport(widget.selectedNode!, layout.positions, canvasSize, viewportSize);
+          });
+        }
 
-        return GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTap: () {
-            setState(() => _focusedNodeId = null);
-            widget.onCanvasTap();
-          },
-          onDoubleTap: () {
-            setState(() => _focusedNodeId = null);
-            widget.onCanvasDoubleTap();
-          },
-          child: Listener(
-            onPointerSignal: (event) => _handlePointerSignal(event, canvasSize, viewportSize, layout.graphBounds),
-            child: InteractiveViewer(
-              transformationController: _transformationController,
-              constrained: false,
-              alignment: Alignment.topLeft,
-              boundaryMargin: EdgeInsets.zero,
-              minScale: minScale,
-              maxScale: 3.5,
-              scaleEnabled: false,
-              trackpadScrollCausesScale: true,
-              panEnabled: _draggingNodeId == null,
-              child: SizedBox(
-                width: canvasSize.width,
-                height: canvasSize.height,
-                child: Stack(
-                  clipBehavior: Clip.none,
-                  children: [
-                    Positioned.fill(
-                      child: CustomPaint(
-                        painter: _EdgePainter(
-                          nodes: widget.nodes,
-                          positions: layout.positions,
-                          focusedNodeId: _focusedNodeId,
-                          hoveredNodeId: _hoveredNodeId,
+        return Stack(
+          children: [
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  setState(() => _focusedNodeId = null);
+                  widget.onCanvasTap();
+                },
+                onDoubleTap: () {
+                  setState(() => _focusedNodeId = null);
+                  widget.onCanvasDoubleTap();
+                },
+                child: InteractiveViewer(
+                  transformationController: _transformationController,
+                  constrained: false,
+                  alignment: Alignment.topLeft,
+                  boundaryMargin: EdgeInsets.zero,
+                  minScale: minScale,
+                  maxScale: _maxCanvasScale,
+                  scaleFactor: _wheelScaleFactor,
+                  scaleEnabled: _draggingNodeId == null,
+                  trackpadScrollCausesScale: false,
+                  panEnabled: _draggingNodeId == null,
+                  onInteractionStart: (_) => _transformAnimationController.stop(),
+                  onInteractionEnd: (_) => _clampCurrentTransform(canvasSize, viewportSize),
+                  child: SizedBox(
+                    width: canvasSize.width,
+                    height: canvasSize.height,
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned.fill(
+                          child: CustomPaint(
+                            painter: _EdgePainter(
+                              nodes: widget.nodes,
+                              positions: layout.positions,
+                              focusedNodeId: _focusedNodeId,
+                              hoveredNodeId: _hoveredNodeId,
+                            ),
+                          ),
                         ),
-                      ),
+                        for (final node in widget.nodes)
+                          Positioned(
+                            key: ValueKey(node.id),
+                            left: layout.positions[node.id]!.dx - layout.sizeFor(node).width / 2,
+                            top: layout.positions[node.id]!.dy - layout.sizeFor(node).height / 2,
+                            child: _KnowledgeGraphNode(
+                              node: node,
+                              root: node.parentId == null,
+                              selected: widget.selectedNode?.id == node.id,
+                              dimmed: _focusedNodeId != null && !_isRelated(node.id, widget.nodes, _focusedNodeId!),
+                              layoutLocked: widget.layoutLocked,
+                              onTap: () => widget.onNodeTap(node),
+                              onDoubleTap: () {
+                                setState(() => _focusedNodeId = node.id);
+                                widget.onNodeDoubleTap(node);
+                              },
+                              onSecondaryTapDown: (details) => _showNodeContextMenu(
+                                context,
+                                node,
+                                details.globalPosition,
+                                layout.positions,
+                                canvasSize,
+                                viewportSize,
+                              ),
+                              onDragStart: () {
+                                if (widget.layoutLocked) {
+                                  return;
+                                }
+                                setState(() {
+                                  _draggingNodeId = node.id;
+                                  _lastDragPosition = layout.positions[node.id];
+                                  _dragDistance = 0;
+                                });
+                                widget.onNodeTap(node);
+                              },
+                              onDragUpdate: (delta) {
+                                if (widget.layoutLocked) {
+                                  return;
+                                }
+                                final current = _lastDragPosition ?? layout.positions[node.id];
+                                if (current == null) {
+                                  return;
+                                }
+                                final scale = _effectiveScale;
+                                final rawMoved = current + delta / scale;
+                                final moved = layout.clampPosition(rawMoved, node);
+                                _dragDistance += delta.distance;
+                                _lastDragPosition = moved;
+                                widget.onNodePositionChanged(node, moved);
+                              },
+                              onDragEnd: () {
+                                if (widget.layoutLocked) {
+                                  return;
+                                }
+                                final position = _lastDragPosition;
+                                final shouldCommit = _dragDistance > 2;
+                                setState(() {
+                                  _draggingNodeId = null;
+                                  _lastDragPosition = null;
+                                  _dragDistance = 0;
+                                });
+                                if (position != null && shouldCommit) {
+                                  widget.onNodePositionCommitted(node, position);
+                                }
+                              },
+                              onHover: (hovering) => setState(() => _hoveredNodeId = hovering ? node.id : null),
+                            ),
+                          ),
+                      ],
                     ),
-                    for (final node in widget.nodes)
-                      Positioned(
-                        key: ValueKey(node.id),
-                        left: layout.positions[node.id]!.dx - layout.sizeFor(node).width / 2,
-                        top: layout.positions[node.id]!.dy - layout.sizeFor(node).height / 2,
-                        child: _KnowledgeGraphNode(
-                          node: node,
-                          root: node.parentId == null,
-                          selected: widget.selectedNode?.id == node.id,
-                          dimmed: _focusedNodeId != null && !_isRelated(node.id, widget.nodes, _focusedNodeId!),
-                          onTap: () => widget.onNodeTap(node),
-                          onDoubleTap: () {
-                            setState(() => _focusedNodeId = node.id);
-                            widget.onNodeDoubleTap(node);
-                          },
-                          onDragStart: () {
-                            setState(() {
-                              _draggingNodeId = node.id;
-                              _lastDragPosition = layout.positions[node.id];
-                              _dragDistance = 0;
-                            });
-                            widget.onNodeTap(node);
-                          },
-                          onDragUpdate: (delta) {
-                            final current = _lastDragPosition ?? layout.positions[node.id];
-                            if (current == null) {
-                              return;
-                            }
-                            final scale = _effectiveScale;
-                            final rawMoved = current + delta / scale;
-                            final moved = layout.clampPosition(rawMoved, node);
-                            _dragDistance += delta.distance;
-                            _lastDragPosition = moved;
-                            widget.onNodePositionChanged(node, moved);
-                          },
-                          onDragEnd: () {
-                            final position = _lastDragPosition;
-                            final shouldCommit = _dragDistance > 2;
-                            setState(() {
-                              _draggingNodeId = null;
-                              _lastDragPosition = null;
-                              _dragDistance = 0;
-                            });
-                            if (position != null && shouldCommit) {
-                              widget.onNodePositionCommitted(node, position);
-                            }
-                          },
-                          onHover: (hovering) => setState(() => _hoveredNodeId = hovering ? node.id : null),
-                        ),
-                      ),
-                  ],
+                  ),
                 ),
               ),
             ),
-          ),
+            Positioned(
+              right: 16,
+              bottom: 16,
+              child: _GraphNavigationOverlay(
+                nodes: widget.nodes,
+                positions: layout.positions,
+                selectedNode: widget.selectedNode,
+                canvasSize: canvasSize,
+                viewportSize: viewportSize,
+                transform: _transformationController.value,
+                scale: _effectiveScale,
+                onFit: () => _fitGraphToViewport(layout.graphBounds, canvasSize, viewportSize),
+                onCenterSelected: widget.selectedNode == null ? null : () => _centerNodeInViewport(widget.selectedNode!, layout.positions, canvasSize, viewportSize),
+              ),
+            ),
+          ],
         );
       },
     );
   }
 
-  void _handlePointerSignal(PointerSignalEvent event, Size canvasSize, Size viewportSize, Rect graphBounds) {
-    if (event is! PointerScrollEvent || event.scrollDelta.dy == 0) {
-      return;
+  void _handleTransformChanged() {
+    if (mounted) {
+      setState(() {});
     }
-
-    final current = _transformationController.value;
-    final oldScale = current.getMaxScaleOnAxis();
-    final isZoomOut = event.scrollDelta.dy > 0;
-    final zoomFactor = event.scrollDelta.dy < 0 ? 1.12 : 0.88;
-    final minScale = _minCanvasScale(canvasSize, viewportSize);
-    final rawScale = oldScale * zoomFactor;
-    final newScale = rawScale.clamp(minScale, 3.5).toDouble();
-    if ((newScale - oldScale).abs() < 0.0001) {
-      return;
-    }
-
-    if (isZoomOut && (newScale - minScale).abs() < 0.0001) {
-      _setCanvasTransformExact(newScale, _centerGraphOffsetAtScale(graphBounds, viewportSize, newScale));
-      return;
-    }
-
-    final mousePosition = event.localPosition;
-    final translation = current.getTranslation();
-    final oldOffset = Offset(translation.x, translation.y);
-    final graphPoint = (mousePosition - oldOffset) / oldScale;
-    final newOffset = mousePosition - graphPoint * newScale;
-
-    _setCanvasTransformExact(newScale, newOffset);
   }
 
-  Offset _centerGraphOffsetAtScale(Rect graphBounds, Size viewportSize, double scale) {
-    if (viewportSize.width <= 0 || viewportSize.height <= 0 || graphBounds.width <= 0 || graphBounds.height <= 0) {
-      return Offset.zero;
+  Future<void> _showNodeContextMenu(
+    BuildContext context,
+    KnowledgeNode node,
+    Offset globalPosition,
+    Map<int, Offset> positions,
+    Size canvasSize,
+    Size viewportSize,
+  ) async {
+    widget.onNodeTap(node);
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final localPosition = overlay.globalToLocal(globalPosition);
+    final selected = await showMenu<_NodeContextAction>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromLTWH(localPosition.dx, localPosition.dy, 1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        const PopupMenuItem(
+          value: _NodeContextAction.createChild,
+          child: _NodeContextMenuItem(icon: Icons.add_circle_outline, label: 'New child node'),
+        ),
+        const PopupMenuItem(
+          value: _NodeContextAction.rename,
+          child: _NodeContextMenuItem(icon: Icons.edit_outlined, label: 'Rename'),
+        ),
+        const PopupMenuItem(
+          value: _NodeContextAction.locate,
+          child: _NodeContextMenuItem(icon: Icons.center_focus_strong_outlined, label: 'Locate'),
+        ),
+        const PopupMenuItem(
+          value: _NodeContextAction.toggleCollapse,
+          child: _NodeContextMenuItem(icon: Icons.account_tree_outlined, label: 'Collapse / expand branch'),
+        ),
+        const PopupMenuItem(
+          value: _NodeContextAction.copyTitle,
+          child: _NodeContextMenuItem(icon: Icons.copy_outlined, label: 'Copy title'),
+        ),
+        PopupMenuItem(
+          value: _NodeContextAction.delete,
+          enabled: node.parentId != null,
+          child: _NodeContextMenuItem(
+            icon: Icons.delete_outline,
+            label: 'Delete',
+            destructive: node.parentId != null,
+          ),
+        ),
+      ],
+    );
+
+    if (!mounted || selected == null) {
+      return;
     }
+    switch (selected) {
+      case _NodeContextAction.createChild:
+        widget.onCreateChildNode(node);
+        break;
+      case _NodeContextAction.rename:
+        widget.onRenameNode(node);
+        break;
+      case _NodeContextAction.delete:
+        if (node.parentId != null) {
+          widget.onDeleteNode(node);
+        }
+        break;
+      case _NodeContextAction.locate:
+        _centerNodeInViewport(node, positions, canvasSize, viewportSize);
+        break;
+      case _NodeContextAction.toggleCollapse:
+        widget.onToggleCollapseBranch(node);
+        break;
+      case _NodeContextAction.copyTitle:
+        await Clipboard.setData(ClipboardData(text: node.title));
+        if (context.mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Node title copied')));
+        }
+        break;
+    }
+  }
+
+  void _fitGraphToViewport(Rect graphBounds, Size canvasSize, Size viewportSize) {
+    if (viewportSize.width <= 0 || viewportSize.height <= 0 || graphBounds.width <= 0 || graphBounds.height <= 0) {
+      return;
+    }
+    final paddedBounds = graphBounds.inflate(96);
+    final scale = math.min(
+      viewportSize.width / paddedBounds.width,
+      viewportSize.height / paddedBounds.height,
+    ).clamp(_minCanvasScaleFloor, 1.0).toDouble();
     final viewportCenter = Offset(viewportSize.width / 2, viewportSize.height / 2);
-    return viewportCenter - graphBounds.center * scale;
+    final translation = viewportCenter - paddedBounds.center * scale;
+    _animateCanvasTransform(canvasSize, viewportSize, scale, translation);
+  }
+
+  void _centerNodeInViewport(KnowledgeNode node, Map<int, Offset> positions, Size canvasSize, Size viewportSize) {
+    final position = positions[node.id];
+    if (position == null || viewportSize.width <= 0 || viewportSize.height <= 0) {
+      return;
+    }
+    final scale = _boundedScale(canvasSize, viewportSize, _effectiveScale);
+    final viewportCenter = Offset(viewportSize.width / 2, viewportSize.height / 2);
+    _animateCanvasTransform(canvasSize, viewportSize, scale, viewportCenter - position * scale);
   }
 
   void _fitCanvasToViewport(Size canvasSize, Size viewportSize) {
@@ -213,38 +371,61 @@ class _KnowledgeGraphCanvasState extends State<KnowledgeGraphCanvas> {
 
   double _minCanvasScale(Size canvasSize, Size viewportSize) {
     if (canvasSize.width <= 0 || canvasSize.height <= 0 || viewportSize.width <= 0 || viewportSize.height <= 0) {
-      return 0.2;
+      return _minCanvasScaleFloor;
     }
     return math.min(
       viewportSize.width / canvasSize.width,
       viewportSize.height / canvasSize.height,
-    ).clamp(0.2, 1.0).toDouble();
+    ).clamp(_minCanvasScaleFloor, 1.0).toDouble();
   }
 
   void _setCanvasTransform(Size canvasSize, Size viewportSize, double scale, Offset translation) {
-    final scaledWidth = canvasSize.width * scale;
-    final scaledHeight = canvasSize.height * scale;
-    final tx = scaledWidth <= viewportSize.width
-        ? (viewportSize.width - scaledWidth) / 2
-        : translation.dx.clamp(viewportSize.width - scaledWidth, 0).toDouble();
-    final ty = scaledHeight <= viewportSize.height
-        ? (viewportSize.height - scaledHeight) / 2
-        : translation.dy.clamp(viewportSize.height - scaledHeight, 0).toDouble();
-    final matrix = Matrix4.identity();
-    matrix.storage[0] = scale;
-    matrix.storage[5] = scale;
-    matrix.storage[12] = tx;
-    matrix.storage[13] = ty;
-    _transformationController.value = matrix;
+    _transformAnimationController.stop();
+    _transformationController.value = _matrixFor(canvasSize, viewportSize, scale, translation);
   }
 
-  void _setCanvasTransformExact(double scale, Offset translation) {
+  void _clampCurrentTransform(Size canvasSize, Size viewportSize) {
+    final current = _transformationController.value;
+    final scale = _boundedScale(canvasSize, viewportSize, current.getMaxScaleOnAxis());
+    final translation = current.getTranslation();
+    final offset = Offset(translation.x, translation.y);
+    final clampedOffset = _clampedTranslation(canvasSize, viewportSize, scale, offset);
+    if ((scale - current.getMaxScaleOnAxis()).abs() < 0.0001 && (clampedOffset - offset).distance < 0.5) {
+      return;
+    }
+    _animateCanvasTransform(canvasSize, viewportSize, scale, clampedOffset);
+  }
+
+  double _boundedScale(Size canvasSize, Size viewportSize, double scale) {
+    return scale.clamp(_minCanvasScale(canvasSize, viewportSize), _maxCanvasScale).toDouble();
+  }
+
+  Offset _clampedTranslation(Size canvasSize, Size viewportSize, double scale, Offset translation) {
+    final scaledWidth = canvasSize.width * scale;
+    final scaledHeight = canvasSize.height * scale;
+    final tx = scaledWidth <= viewportSize.width ? (viewportSize.width - scaledWidth) / 2 : translation.dx.clamp(viewportSize.width - scaledWidth, 0).toDouble();
+    final ty = scaledHeight <= viewportSize.height ? (viewportSize.height - scaledHeight) / 2 : translation.dy.clamp(viewportSize.height - scaledHeight, 0).toDouble();
+    return Offset(tx, ty);
+  }
+
+  void _animateCanvasTransform(Size canvasSize, Size viewportSize, double scale, Offset translation) {
+    _transformAnimationController.stop();
+    _transformAnimation = Matrix4Tween(
+      begin: _transformationController.value.clone(),
+      end: _matrixFor(canvasSize, viewportSize, scale, translation),
+    ).animate(CurvedAnimation(parent: _transformAnimationController, curve: Curves.easeOutCubic));
+    _transformAnimationController.forward(from: 0);
+  }
+
+  Matrix4 _matrixFor(Size canvasSize, Size viewportSize, double scale, Offset translation) {
+    final boundedScale = _boundedScale(canvasSize, viewportSize, scale);
+    final clampedTranslation = _clampedTranslation(canvasSize, viewportSize, boundedScale, translation);
     final matrix = Matrix4.identity();
-    matrix.storage[0] = scale;
-    matrix.storage[5] = scale;
-    matrix.storage[12] = translation.dx;
-    matrix.storage[13] = translation.dy;
-    _transformationController.value = matrix;
+    matrix.storage[0] = boundedScale;
+    matrix.storage[5] = boundedScale;
+    matrix.storage[12] = clampedTranslation.dx;
+    matrix.storage[13] = clampedTranslation.dy;
+    return matrix;
   }
 
   int _rootNodeId(List<KnowledgeNode> nodes) {
@@ -278,6 +459,293 @@ class _KnowledgeGraphCanvasState extends State<KnowledgeGraphCanvas> {
     }
     return false;
   }
+}
+
+class _GraphNavigationOverlay extends StatelessWidget {
+  const _GraphNavigationOverlay({
+    required this.nodes,
+    required this.positions,
+    required this.selectedNode,
+    required this.canvasSize,
+    required this.viewportSize,
+    required this.transform,
+    required this.scale,
+    required this.onFit,
+    required this.onCenterSelected,
+  });
+
+  final List<KnowledgeNode> nodes;
+  final Map<int, Offset> positions;
+  final KnowledgeNode? selectedNode;
+  final Size canvasSize;
+  final Size viewportSize;
+  final Matrix4 transform;
+  final double scale;
+  final VoidCallback onFit;
+  final VoidCallback? onCenterSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        DecoratedBox(
+          decoration: BoxDecoration(
+            color: MindVaultColors.surface.withValues(alpha: 0.94),
+            border: Border.all(color: MindVaultColors.border),
+            borderRadius: BorderRadius.circular(8),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.08),
+                blurRadius: 18,
+                offset: const Offset(0, 8),
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Tooltip(
+                  message: 'Fit to screen',
+                  child: IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.fit_screen_outlined, size: 18),
+                    onPressed: onFit,
+                  ),
+                ),
+                Tooltip(
+                  message: 'Center selected node',
+                  child: IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.center_focus_strong_outlined, size: 18),
+                    onPressed: onCenterSelected,
+                  ),
+                ),
+                const SizedBox(width: 4),
+                SizedBox(
+                  width: 54,
+                  child: Text(
+                    '${(scale * 100).round()}%',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: MindVaultColors.muted,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _MiniMap(
+          nodes: nodes,
+          positions: positions,
+          selectedNode: selectedNode,
+          canvasSize: canvasSize,
+          viewportSize: viewportSize,
+          transform: transform,
+        ),
+      ],
+    );
+  }
+}
+
+enum _NodeContextAction { createChild, rename, delete, locate, toggleCollapse, copyTitle }
+
+class _NodeContextMenuItem extends StatelessWidget {
+  const _NodeContextMenuItem({
+    required this.icon,
+    required this.label,
+    this.destructive = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = destructive ? MindVaultColors.error : MindVaultColors.text;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 10),
+        Text(label, style: TextStyle(color: color)),
+      ],
+    );
+  }
+}
+
+class _MiniMap extends StatelessWidget {
+  const _MiniMap({
+    required this.nodes,
+    required this.positions,
+    required this.selectedNode,
+    required this.canvasSize,
+    required this.viewportSize,
+    required this.transform,
+  });
+
+  final List<KnowledgeNode> nodes;
+  final Map<int, Offset> positions;
+  final KnowledgeNode? selectedNode;
+  final Size canvasSize;
+  final Size viewportSize;
+  final Matrix4 transform;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: MindVaultColors.surface.withValues(alpha: 0.94),
+        border: Border.all(color: MindVaultColors.border),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.08),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: SizedBox(
+        width: 184,
+        height: 124,
+        child: CustomPaint(
+          painter: _MiniMapPainter(
+            nodes: nodes,
+            positions: positions,
+            selectedNode: selectedNode,
+            canvasSize: canvasSize,
+            viewportSize: viewportSize,
+            transform: transform,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MiniMapPainter extends CustomPainter {
+  const _MiniMapPainter({
+    required this.nodes,
+    required this.positions,
+    required this.selectedNode,
+    required this.canvasSize,
+    required this.viewportSize,
+    required this.transform,
+  });
+
+  final List<KnowledgeNode> nodes;
+  final Map<int, Offset> positions;
+  final KnowledgeNode? selectedNode;
+  final Size canvasSize;
+  final Size viewportSize;
+  final Matrix4 transform;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const padding = 10.0;
+    final available = Rect.fromLTWH(padding, padding, size.width - padding * 2, size.height - padding * 2);
+    if (canvasSize.width <= 0 || canvasSize.height <= 0 || available.width <= 0 || available.height <= 0) {
+      return;
+    }
+
+    final canvasScale = math.min(available.width / canvasSize.width, available.height / canvasSize.height);
+    final mapSize = Size(canvasSize.width * canvasScale, canvasSize.height * canvasScale);
+    final mapRect = Rect.fromLTWH(
+      available.left + (available.width - mapSize.width) / 2,
+      available.top + (available.height - mapSize.height) / 2,
+      mapSize.width,
+      mapSize.height,
+    );
+
+    final backgroundPaint = Paint()..color = MindVaultColors.background;
+    final borderPaint = Paint()
+      ..color = MindVaultColors.border
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+    final edgePaint = Paint()
+      ..color = MindVaultColors.border.withValues(alpha: 0.75)
+      ..strokeWidth = 1
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
+    final nodePaint = Paint()..color = MindVaultColors.muted.withValues(alpha: 0.55);
+    final selectedPaint = Paint()..color = MindVaultColors.primary;
+    final rootPaint = Paint()..color = const Color(0xFF1F2937);
+    final viewportPaint = Paint()
+      ..color = MindVaultColors.primary.withValues(alpha: 0.12)
+      ..style = PaintingStyle.fill;
+    final viewportBorderPaint = Paint()
+      ..color = MindVaultColors.primary
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.4;
+
+    canvas.drawRRect(RRect.fromRectAndRadius(mapRect, const Radius.circular(6)), backgroundPaint);
+
+    Offset mapPoint(Offset point) {
+      return mapRect.topLeft + Offset(point.dx * canvasScale, point.dy * canvasScale);
+    }
+
+    for (final node in nodes) {
+      if (node.parentId == null || positions[node.parentId] == null || positions[node.id] == null) {
+        continue;
+      }
+      final from = mapPoint(positions[node.parentId]!);
+      final to = mapPoint(positions[node.id]!);
+      canvas.drawLine(from, to, edgePaint);
+    }
+
+    for (final node in nodes) {
+      final position = positions[node.id];
+      if (position == null) {
+        continue;
+      }
+      final point = mapPoint(position);
+      final paint = selectedNode?.id == node.id ? selectedPaint : node.parentId == null ? rootPaint : nodePaint;
+      final radius = node.parentId == null ? 3.8 : 3.0;
+      canvas.drawCircle(point, radius, paint);
+    }
+
+    final viewport = _visibleCanvasRect();
+    if (viewport.width > 0 && viewport.height > 0) {
+      final rect = Rect.fromLTRB(
+        mapRect.left + viewport.left * canvasScale,
+        mapRect.top + viewport.top * canvasScale,
+        mapRect.left + viewport.right * canvasScale,
+        mapRect.top + viewport.bottom * canvasScale,
+      );
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(4)), viewportPaint);
+      canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(4)), viewportBorderPaint);
+    }
+
+    canvas.drawRRect(RRect.fromRectAndRadius(mapRect, const Radius.circular(6)), borderPaint);
+  }
+
+  Rect _visibleCanvasRect() {
+    final scale = transform.getMaxScaleOnAxis();
+    if (scale <= 0) {
+      return Rect.zero;
+    }
+    final translation = transform.getTranslation();
+    final left = math.max(0.0, -translation.x / scale);
+    final top = math.max(0.0, -translation.y / scale);
+    final right = math.min(canvasSize.width, (viewportSize.width - translation.x) / scale);
+    final bottom = math.min(canvasSize.height, (viewportSize.height - translation.y) / scale);
+    if (right <= left || bottom <= top) {
+      return Rect.zero;
+    }
+    return Rect.fromLTRB(left, top, right, bottom);
+  }
+
+  @override
+  bool shouldRepaint(covariant _MiniMapPainter oldDelegate) => true;
 }
 
 class _GraphLayout {
@@ -528,8 +996,10 @@ class _KnowledgeGraphNode extends StatelessWidget {
     required this.root,
     required this.selected,
     required this.dimmed,
+    required this.layoutLocked,
     required this.onTap,
     required this.onDoubleTap,
+    required this.onSecondaryTapDown,
     required this.onDragStart,
     required this.onDragUpdate,
     required this.onDragEnd,
@@ -540,8 +1010,10 @@ class _KnowledgeGraphNode extends StatelessWidget {
   final bool root;
   final bool selected;
   final bool dimmed;
+  final bool layoutLocked;
   final VoidCallback onTap;
   final VoidCallback onDoubleTap;
+  final ValueChanged<TapDownDetails> onSecondaryTapDown;
   final VoidCallback onDragStart;
   final ValueChanged<Offset> onDragUpdate;
   final VoidCallback onDragEnd;
@@ -553,12 +1025,13 @@ class _KnowledgeGraphNode extends StatelessWidget {
       behavior: HitTestBehavior.opaque,
       onTap: onTap,
       onDoubleTap: onDoubleTap,
-      onPanStart: (_) => onDragStart(),
-      onPanUpdate: (details) => onDragUpdate(details.delta),
-      onPanEnd: (_) => onDragEnd(),
-      onPanCancel: onDragEnd,
+      onSecondaryTapDown: onSecondaryTapDown,
+      onPanStart: layoutLocked ? null : (_) => onDragStart(),
+      onPanUpdate: layoutLocked ? null : (details) => onDragUpdate(details.delta),
+      onPanEnd: layoutLocked ? null : (_) => onDragEnd(),
+      onPanCancel: layoutLocked ? null : onDragEnd,
       child: MouseRegion(
-        cursor: SystemMouseCursors.grab,
+        cursor: layoutLocked ? SystemMouseCursors.basic : SystemMouseCursors.grab,
         onEnter: (_) => onHover(true),
         onExit: (_) => onHover(false),
         child: AnimatedScale(

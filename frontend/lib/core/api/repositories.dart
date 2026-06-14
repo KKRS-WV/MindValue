@@ -83,12 +83,16 @@ class NodeRepository {
     required String title,
     int? parentId,
     String? description,
+    double? positionX,
+    double? positionY,
   }) async {
     final response = await _apiClient.dio.post('/nodes', data: {
       'knowledgeBaseId': knowledgeBaseId,
       'parentId': parentId,
       'title': title,
       'description': description,
+      'positionX': positionX,
+      'positionY': positionY,
     });
     return KnowledgeNode.fromJson(response.data as Map<String, dynamic>);
   }
